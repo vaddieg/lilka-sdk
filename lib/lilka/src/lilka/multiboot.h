@@ -5,6 +5,10 @@
 #ifndef MULTIBOOT_CMD_LEN
 #    define MULTIBOOT_CMD_LEN 1024
 #endif
+#define MULTIBOOT_SPIFFS_SEGMENTS 5
+#define MULTIBOOT_SPIFFS_BEGIN 0xc90000
+#define MULTIBOOT_SPIFFS_SIZE 0x360000
+
 #include "fileutils.h"
 
 namespace lilka {
@@ -80,6 +84,20 @@ public:
     /// Отримати шлях до файлу прошивки, встановлений у параметрах командного рядка.
     /// @return Шлях до файлу прошивки як рядок (String). Якщо шлях
     String getFirmwarePath();
+    /// "Віртуалізація" або сегментація великого розділу SPIFFS для ізоляції OTA-прошивок,
+    /// щоб ті не перезаписували дані одна одної.
+    /// Кількість сегментів N = MULTIBOOT_SPIFFS_SEGMENTS
+    ///
+    /// Повертає номер активного сегменту SPIFFS у таблиці розділів 
+    /// @return номер активного сегменту 0..N, -1 у разі помилки
+    int getActiveSSPIFFSSegment();
+    /// Встановлює сегмент як активний у таблиці розділів  
+    /// @param segment номер сегменту для активації 0..N
+    /// @return ESP_OK або <0 у разі помилки
+    int setActiveSSPIFFSSegment(int segment);
+    /// Вирахування сегменту в залежності від імені прошивки
+    /// @return номер сегменту 0..N
+    int segmentForOTAFirmware(String path);
 
 private:
     String path;

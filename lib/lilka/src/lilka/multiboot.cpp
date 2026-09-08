@@ -6,6 +6,11 @@
 #include "fileutils.h"
 #include "serial.h"
 #include <esp_crc.h>
+#include <esp_rom_md5.h>
+#include <esp_partition.h>
+#include <esp_system.h>
+#include <esp_flash_partitions.h>
+
 #define MULTIBOOT_KCMD_DEFAULT_LOCATION 0x50000000
 typedef struct {
     char cmd[MULTIBOOT_CMD_LEN];
@@ -29,6 +34,15 @@ MultiBoot::MultiBoot() :
 }
 
 void MultiBoot::begin() {
+    // Якщо кейра колись почне давати користувачам SPIFFS
+    // то треба буде встановлювати активним сегмент #0
+    // станом на зараз можна тримати закоментованим
+    // if (getActiveSSPIFFSSegment() > 0) {
+    //     if (setActiveSSPIFFSSegment(0) == ESP_OK) {
+    //         esp_restart();
+    //     }
+    // }
+
     // Get commandline args
     bool verify_kcmd_loc = &kcmd == reinterpret_cast<KernelParams*>(MULTIBOOT_KCMD_DEFAULT_LOCATION);
     if (!verify_kcmd_loc) {
@@ -276,7 +290,7 @@ int MultiBoot::finishAndReboot() {
     }
 
     // Запуск нової прошивки.
-    esp_restart();
+    bootLast();
 
     return 0; // unreachable
 }
@@ -285,6 +299,11 @@ void MultiBoot::bootLast() {
     auto err = esp_ota_set_boot_partition(ota_partition);
     if (err != ESP_OK) {
         serial.err("Failed to set boot partition: %d", err);
+    }
+    // Також активуєм відповідний сегмент SPIFFFS
+    int segment = segmentForOTAFirmware(getFirmwarePath());
+    if (segment >= 0 && getActiveSSPIFFSSegment() != segment) {
+        setActiveSSPIFFSSegment(segment);
     }
 
     esp_restart();
@@ -301,6 +320,159 @@ String MultiBoot::getFirmwarePath() {
     prefs.end();
     return arg;
 }
+
+static int readPartitionTable(uint8_t *table) {
+
+    const esp_partition_t *pt =
+        esp_partition_find_first(
+            PART_TYPE_PARTITION_TABLE,
+            PART_SUBTYPE_PARTITION_TABLE_PRIMARY,
+            NULL);
+    if (pt == NULL) {
+        serial.err("Can't find the primary partition table");
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    return esp_partition_read(pt, table, 0, ESP_PARTITION_TABLE_SIZE);
+}
+
+static int writePartitionTable(uint8_t *table) {
+    // Шукаєм таблицю розділів
+    сonst esp_partition_t *pt =
+        esp_partition_find_first(
+            PART_TYPE_PARTITION_TABLE,
+            PART_SUBTYPE_PARTITION_TABLE_PRIMARY,
+            NULL);
+    if (pt == NULL) {
+        serial.err("Can't find the primary partition table");
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    // Рахуєм новий md5 (0x000 ... 0xBFF)
+    uint8_t digest[16];
+    md5_context_t md5_ctx;
+
+    esp_rom_md5_init(&md5_ctx);
+    esp_rom_md5_update(&md5_ctx, table, ESP_PARTITION_TABLE_MAX_LEN);
+    esp_rom_md5_final(digest, &md5_ctx);
+
+    esp_partition_info_t *md5entry = (esp_partition_info_t *)(table + ESP_PARTITION_TABLE_MAX_LEN);
+
+    memset(md5entry, 0xFF, sizeof(esp_partition_info_t));
+    md5entry->magic = ESP_PARTITION_MAGIC_MD5;
+
+    // пишем md5 digest
+    memcpy(
+        table + ESP_PARTITION_TABLE_MAX_LEN + ESP_PARTITION_MD5_OFFSET,
+        digest,
+        sizeof(digest));
+
+    // перезаписуєм розділ
+    esp_ota_handle_t handle;
+    esp_err_t err = esp_ota_begin(pt, ESP_PARTITION_TABLE_SIZE, &ota_handle);
+    if (err != ESP_OR) return err;
+    err = esp_ota_write(handle, table, PARTITION_TABLE_SIZE);
+    if (err != ESP_OK) {
+        esp_ota_abort(handle);
+        return err;
+    }
+
+    return esp_ota_end(handle);
+}
+
+int MultiBoot::getActiveSSPIFFSSegment() {
+
+    uint8_t table[PARTITION_TABLE_SIZE];
+    if (readPartitionTable(&table) != ESP_OK) return 0;
+        
+    // Шукаєм SPIFFS
+    esp_partition_info_t *spiffs = NULL;
+    for (size_t i = 0; i < ESP_PARTITION_TABLE_MAX_ENTRIES; i++) {
+
+        esp_partition_info_t *entry = (esp_partition_info_t *)(
+            table + i * sizeof(esp_partition_info_t));
+        if (entry->type == ESP_PARTITION_TYPE_DATA && entry->subtype == ESP_PARTITION_SUBTYPE_DATA_SPIFFS) {
+            spiffs = entry;
+            break;
+        }
+    }
+    
+    if (!spiffs) {
+        serial.err("Can't find any SPIFFS partition");
+        return ESP_ERR_NOT_FOUND; // Поганий сценарій, коли якась OTA-прошивка змінила тип розділу
+    }
+
+    // SPIFFS знайдено. 
+    esp_partition_pos_t pos = spiffs->pos;
+    // Перевіряємо, чи розділ сегментований
+    if (pos.offset == MULTIBOOT_SPIFFS_BEGIN && pos.size == MULTIBOOT_SPIFFS_SIZE) {
+        return -1;
+    }
+
+    // Рахуємо активний сегмент
+    int segSize = MULTIBOOT_SPIFFS_SIZE / MULTIBOOT_SPIFFS_SEGMENTS;
+    int segment = (pos.offset - MULTIBOOT_SPIFFS_BEGIN) / segSize;
+    serial.log("Active SPIFFFS segment: %d", segment);
+
+    return segment;
+}
+
+int MultiBoot::setActiveSSPIFFSSegment(int segment) {
+
+    uint8_t table[PARTITION_TABLE_SIZE];
+    if (readPartitionTable(&table) != ESP_OK) return 0;
+        
+    // Шукаєм SPIFFS
+    esp_partition_info_t *spiffs = NULL;
+    for (size_t i = 0; i < ESP_PARTITION_TABLE_MAX_ENTRIES; i++) {
+
+        esp_partition_info_t *entry = (esp_partition_info_t *)(
+            table + i * sizeof(esp_partition_info_t));
+        if (entry->type == ESP_PARTITION_TYPE_DATA && entry->subtype == ESP_PARTITION_SUBTYPE_DATA_SPIFFS) {
+            spiffs = entry;
+            break;
+        }
+    }
+    
+    if (!spiffs) {
+        serial.err("Can't find any SPIFFS partition");
+        return ESP_ERR_NOT_FOUND; // Поганий сценарій, коли якась OTA-прошивка змінила тип розділу
+    }
+
+    int segSize = MULTIBOOT_SPIFFS_SIZE / MULTIBOOT_SPIFFS_SEGMENTS;
+    spiffs->pos.offset = MULTIBOOT_SPIFFS_BEGIN + segment * segSize;
+    spiffs->pos.size = segSize;
+
+    int err = writePartitionTable(&table);
+    if (err != ESP_OK) {
+        serial.err("Can't write Partition table: %d", err);
+    } else {
+        serial.log("Activated SPIFFFS segment: %d", segment);
+        // Тепер готові до ребуту
+    }
+    return err;
+}
+
+int MultiBoot::segmentForOTAFirmware(String path) {
+    // Вирахування сегменту в залежності від імені прошивки
+    // Для простоти та зворотньої сумісності:
+    // *.bin0, Keira -> 0 
+    // *.bin, *.bin1 -> 1
+    // *.bin2 -> 2, і так далі
+    String lower = path.toLowerCase();
+    if (lower.endsWith("bin")) return 1;
+
+    int fileExtPos = lower.lastIndexOf("bin");
+    if (fileExtPos > 0) {
+        long num = lower.substring(fileExtPos+3).toInt();
+        if (num < MULTIBOOT_SPIFFS_SEGMENTS) return num;
+    }
+
+    serial.err("Can't determine SPIFFS segment. Using Keira default");
+    return 0;
+}
+
+
 void MultiBoot::setCMDParams(String cmd) {
     if (cmd.length() > MULTIBOOT_CMD_LEN) {
         serial.err("Too long commandline for kernel set. Consider enlarging MULTIBOOT_CMD_LEN");
