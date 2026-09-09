@@ -321,27 +321,32 @@ String MultiBoot::getFirmwarePath() {
     return arg;
 }
 
+// Not defined in some ESP32 SDKs
+#define ESP_PARTITION_TYPE_PARTITION_TABLE 0x03
+#define ESP_PARTITION_SUBTYPE_PARTITION_TABLE_PRIMARY 0x00
+#define ESP_PARTITION_TABLE_SIZE (0x1000)
+
 static int readPartitionTable(uint8_t *table) {
 
     const esp_partition_t *pt =
         esp_partition_find_first(
-            PART_TYPE_PARTITION_TABLE,
-            PART_SUBTYPE_PARTITION_TABLE_PRIMARY,
+            (esp_partition_type_t)ESP_PARTITION_TYPE_PARTITION_TABLE,
+            (esp_partition_subtype_t)ESP_PARTITION_SUBTYPE_PARTITION_TABLE_PRIMARY,
             NULL);
     if (pt == NULL) {
         serial.err("Can't find the primary partition table");
         return ESP_ERR_NOT_FOUND;
     }
 
-    return esp_partition_read(pt, table, 0, ESP_PARTITION_TABLE_SIZE);
+    return esp_partition_read(pt, 0, table,  ESP_PARTITION_TABLE_SIZE);
 }
 
 static int writePartitionTable(uint8_t *table) {
     // Шукаєм таблицю розділів
-    сonst esp_partition_t *pt =
+    const esp_partition_t *pt =
         esp_partition_find_first(
-            PART_TYPE_PARTITION_TABLE,
-            PART_SUBTYPE_PARTITION_TABLE_PRIMARY,
+            (esp_partition_type_t)ESP_PARTITION_TYPE_PARTITION_TABLE,
+            (esp_partition_subtype_t)ESP_PARTITION_SUBTYPE_PARTITION_TABLE_PRIMARY,
             NULL);
     if (pt == NULL) {
         serial.err("Can't find the primary partition table");
@@ -369,9 +374,9 @@ static int writePartitionTable(uint8_t *table) {
 
     // перезаписуєм розділ
     esp_ota_handle_t handle;
-    esp_err_t err = esp_ota_begin(pt, ESP_PARTITION_TABLE_SIZE, &ota_handle);
-    if (err != ESP_OR) return err;
-    err = esp_ota_write(handle, table, PARTITION_TABLE_SIZE);
+    esp_err_t err = esp_ota_begin(pt, ESP_PARTITION_TABLE_SIZE, &handle);
+    if (err != ESP_OK) return err;
+    err = esp_ota_write(handle, table, ESP_PARTITION_TABLE_SIZE);
     if (err != ESP_OK) {
         esp_ota_abort(handle);
         return err;
@@ -382,8 +387,8 @@ static int writePartitionTable(uint8_t *table) {
 
 int MultiBoot::getActiveSSPIFFSSegment() {
 
-    uint8_t table[PARTITION_TABLE_SIZE];
-    if (readPartitionTable(&table) != ESP_OK) return 0;
+    uint8_t table[ESP_PARTITION_TABLE_SIZE];
+    if (readPartitionTable(table) != ESP_OK) return 0;
         
     // Шукаєм SPIFFS
     esp_partition_info_t *spiffs = NULL;
@@ -419,8 +424,8 @@ int MultiBoot::getActiveSSPIFFSSegment() {
 
 int MultiBoot::setActiveSSPIFFSSegment(int segment) {
 
-    uint8_t table[PARTITION_TABLE_SIZE];
-    if (readPartitionTable(&table) != ESP_OK) return 0;
+    uint8_t table[ESP_PARTITION_TABLE_SIZE];
+    if (readPartitionTable(table) != ESP_OK) return 0;
         
     // Шукаєм SPIFFS
     esp_partition_info_t *spiffs = NULL;
@@ -443,7 +448,7 @@ int MultiBoot::setActiveSSPIFFSSegment(int segment) {
     spiffs->pos.offset = MULTIBOOT_SPIFFS_BEGIN + segment * segSize;
     spiffs->pos.size = segSize;
 
-    int err = writePartitionTable(&table);
+    int err = writePartitionTable(table);
     if (err != ESP_OK) {
         serial.err("Can't write Partition table: %d", err);
     } else {
@@ -459,12 +464,12 @@ int MultiBoot::segmentForOTAFirmware(String path) {
     // *.bin0, Keira -> 0 
     // *.bin, *.bin1 -> 1
     // *.bin2 -> 2, і так далі
-    String lower = path.toLowerCase();
-    if (lower.endsWith("bin")) return 1;
+    path.toLowerCase();
+    if (path.endsWith("bin")) return 1;
 
-    int fileExtPos = lower.lastIndexOf("bin");
+    int fileExtPos = path.lastIndexOf("bin");
     if (fileExtPos > 0) {
-        long num = lower.substring(fileExtPos+3).toInt();
+        long num = path.substring(fileExtPos+3).toInt();
         if (num < MULTIBOOT_SPIFFS_SEGMENTS) return num;
     }
 
