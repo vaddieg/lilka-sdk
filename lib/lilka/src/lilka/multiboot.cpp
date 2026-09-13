@@ -4,6 +4,7 @@
 
 #include "multiboot.h"
 #include "fileutils.h"
+#include "sys.h"
 #include "serial.h"
 #include <esp_crc.h>
 #include <esp_rom_md5.h>
@@ -22,6 +23,9 @@ RTC_DATA_ATTR KernelParams kcmd;
 extern "C" bool verifyRollbackLater() {
     return true;
 }
+
+// брудний хак
+extern esp_err_t rom_esp_flash_erase_region(esp_flash_t *chip, uint32_t start, uint32_t len);
 
 namespace lilka {
 
@@ -43,6 +47,7 @@ void MultiBoot::begin() {
     //     }
     // }
 
+    lilka::sys.print_partition_table();
     // Get commandline args
     bool verify_kcmd_loc = &kcmd == reinterpret_cast<KernelParams*>(MULTIBOOT_KCMD_DEFAULT_LOCATION);
     if (!verify_kcmd_loc) {
@@ -224,6 +229,7 @@ int MultiBoot::start(String path) {
     // TODO: Store arg in RAM?
     arg = lilka::fileutils.getLocalPathInfo(arg).path;
 
+    serial.log("Saved firmware name: %s", arg.c_str());
     prefs.putString(MULTIBOOT_PATH_KEY, arg);
     prefs.end();
 
@@ -283,11 +289,11 @@ int MultiBoot::finishAndReboot() {
     }
 
     // Перевстановлення активного розділу на OTA-розділ (його буде запущено лише один раз, після чого активним залишиться основний розділ).
-    err = esp_ota_set_boot_partition(ota_partition);
-    if (err != ESP_OK) {
-        serial.err("Failed to set boot partition: %d", err);
-        return -8;
-    }
+    // err = esp_ota_set_boot_partition(ota_partition);
+    // if (err != ESP_OK) {
+    //     serial.err("Failed to set boot partition: %d", err);
+    //     return -8;
+    // }
 
     // Запуск нової прошивки.
     bootLast();
@@ -296,14 +302,23 @@ int MultiBoot::finishAndReboot() {
 }
 
 void MultiBoot::bootLast() {
+    serial.log("Booting last OTA...");
+
+    // активуєм відповідний сегмент SPIFFFS
+    int segment = segmentForOTAFirmware(getFirmwarePath());
+    serial.log("Requested segment %d", segment);
+    
+    if (segment >= 0 && getActiveSSPIFFSSegment() != segment) {
+        serial.log("Setting SPIFFS segment %d", segment);
+        delay(10);
+        setActiveSSPIFFSSegment(segment);
+    }
+
+    delay(10);//let logs drop
+    // Перевстановлення активного розділу на OTA-розділ (його буде запущено лише один раз, після чого активним залишиться основний розділ).
     auto err = esp_ota_set_boot_partition(ota_partition);
     if (err != ESP_OK) {
         serial.err("Failed to set boot partition: %d", err);
-    }
-    // Також активуєм відповідний сегмент SPIFFFS
-    int segment = segmentForOTAFirmware(getFirmwarePath());
-    if (segment >= 0 && getActiveSSPIFFSSegment() != segment) {
-        setActiveSSPIFFSSegment(segment);
     }
 
     esp_restart();
@@ -315,43 +330,36 @@ String MultiBoot::getFirmwarePath() {
     String arg = "";
     if (prefs.isKey(MULTIBOOT_PATH_KEY)) {
         arg = prefs.getString(MULTIBOOT_PATH_KEY);
-        prefs.remove(MULTIBOOT_PATH_KEY);
     }
     prefs.end();
     return arg;
 }
 
 // Not defined in some ESP32 SDKs
-#define ESP_PARTITION_TYPE_PARTITION_TABLE 0x03
-#define ESP_PARTITION_SUBTYPE_PARTITION_TABLE_PRIMARY 0x00
-#define ESP_PARTITION_TABLE_SIZE (0x1000)
+#define ESP_PARTITION_TABLE_SIZE 0x1000
 
 static int readPartitionTable(uint8_t *table) {
+    // esp_flash_t chip;
+    // chip.read_mode = SPI_FLASH_FASTRD;
+    // esp_err_t err = esp_flash_init(&chip);
 
-    const esp_partition_t *pt =
-        esp_partition_find_first(
-            (esp_partition_type_t)ESP_PARTITION_TYPE_PARTITION_TABLE,
-            (esp_partition_subtype_t)ESP_PARTITION_SUBTYPE_PARTITION_TABLE_PRIMARY,
-            NULL);
-    if (pt == NULL) {
-        serial.err("Can't find the primary partition table");
-        return ESP_ERR_NOT_FOUND;
+    // serial.log("esp_flash_init donee %s", esp_err_to_name(err));
+    // delay(10);
+
+    esp_err_t err = esp_flash_read(NULL, table, ESP_PARTITION_TABLE_OFFSET, ESP_PARTITION_TABLE_SIZE);
+
+    if (err != ESP_OK) {
+        serial.err("Can't read PT from flash");
     }
 
-    return esp_partition_read(pt, 0, table,  ESP_PARTITION_TABLE_SIZE);
+    serial.log("esp_flash_read donee");
+    delay(10);
+
+    return err;
 }
 
 static int writePartitionTable(uint8_t *table) {
-    // Шукаєм таблицю розділів
-    const esp_partition_t *pt =
-        esp_partition_find_first(
-            (esp_partition_type_t)ESP_PARTITION_TYPE_PARTITION_TABLE,
-            (esp_partition_subtype_t)ESP_PARTITION_SUBTYPE_PARTITION_TABLE_PRIMARY,
-            NULL);
-    if (pt == NULL) {
-        serial.err("Can't find the primary partition table");
-        return ESP_ERR_NOT_FOUND;
-    }
+
 
     // Рахуєм новий md5 (0x000 ... 0xBFF)
     uint8_t digest[16];
@@ -372,24 +380,47 @@ static int writePartitionTable(uint8_t *table) {
         digest,
         sizeof(digest));
 
-    // перезаписуєм розділ
-    esp_ota_handle_t handle;
-    esp_err_t err = esp_ota_begin(pt, ESP_PARTITION_TABLE_SIZE, &handle);
-    if (err != ESP_OK) return err;
-    err = esp_ota_write(handle, table, ESP_PARTITION_TABLE_SIZE);
-    if (err != ESP_OK) {
-        esp_ota_abort(handle);
-        return err;
-    }
+    serial.log("ready to esp_flash_write");   
+    delay(20);
+    
+    esp_err_t err;
+    // const esp_flash_region_t* regions;
+    // uint32_t numRegions;
+    
+    // err = esp_flash_get_protectable_regions(esp_flash_default_chip, &regions, &numRegions);
 
-    return esp_ota_end(handle);
+    // serial.log("Regiouns found %d error %s", numRegions, esp_err_to_name(err));
+    // delay(19);
+    // if (err != ESP_OK) return err;
+    
+    // for (int i=0; i<numRegions; i++) {
+    //     serial.log("Region %x", regions[i].offset);
+    //     delay(10);
+
+    //     if (regions[i].offset == ESP_PARTITION_TABLE_OFFSET) {
+    //         esp_flash_set_protected_region(NULL, &regions[i], false);
+    //         serial.log("PROTECTION REMOVED %d", err);
+    //         delay(10);
+
+    //         break;
+    //     }
+    // }
+    
+    // Це не працює для розділу partition table (
+    err = esp_flash_erase_region(NULL, ESP_PARTITION_TABLE_OFFSET, ESP_PARTITION_TABLE_SIZE);
+    serial.log("PT ERACED %s", esp_err_to_name(err));
+    delay(20); 
+    // перезаписуєм розділ
+    return esp_flash_write(NULL, table, ESP_PARTITION_TABLE_OFFSET, ESP_PARTITION_TABLE_SIZE);
 }
 
 int MultiBoot::getActiveSSPIFFSSegment() {
 
     uint8_t table[ESP_PARTITION_TABLE_SIZE];
+    serial.log("-----------reading PT!");
+    delay(10);
     if (readPartitionTable(table) != ESP_OK) return 0;
-        
+    serial.log("-----------PT read success!");
     // Шукаєм SPIFFS
     esp_partition_info_t *spiffs = NULL;
     for (size_t i = 0; i < ESP_PARTITION_TABLE_MAX_ENTRIES; i++) {
@@ -398,6 +429,7 @@ int MultiBoot::getActiveSSPIFFSSegment() {
             table + i * sizeof(esp_partition_info_t));
         if (entry->type == ESP_PARTITION_TYPE_DATA && entry->subtype == ESP_PARTITION_SUBTYPE_DATA_SPIFFS) {
             spiffs = entry;
+            serial.log("SPIFFS found: %x", spiffs->pos.offset);
             break;
         }
     }
@@ -407,6 +439,7 @@ int MultiBoot::getActiveSSPIFFSSegment() {
         return ESP_ERR_NOT_FOUND; // Поганий сценарій, коли якась OTA-прошивка змінила тип розділу
     }
 
+    delay(10);
     // SPIFFS знайдено. 
     esp_partition_pos_t pos = spiffs->pos;
     // Перевіряємо, чи розділ сегментований
@@ -418,7 +451,8 @@ int MultiBoot::getActiveSSPIFFSSegment() {
     int segSize = MULTIBOOT_SPIFFS_SIZE / MULTIBOOT_SPIFFS_SEGMENTS;
     int segment = (pos.offset - MULTIBOOT_SPIFFS_BEGIN) / segSize;
     serial.log("Active SPIFFFS segment: %d", segment);
-
+    
+    delay(10);
     return segment;
 }
 
@@ -435,6 +469,8 @@ int MultiBoot::setActiveSSPIFFSSegment(int segment) {
             table + i * sizeof(esp_partition_info_t));
         if (entry->type == ESP_PARTITION_TYPE_DATA && entry->subtype == ESP_PARTITION_SUBTYPE_DATA_SPIFFS) {
             spiffs = entry;
+            serial.log("SPIFFS partition found!");
+            delay(10);
             break;
         }
     }
@@ -448,6 +484,9 @@ int MultiBoot::setActiveSSPIFFSSegment(int segment) {
     spiffs->pos.offset = MULTIBOOT_SPIFFS_BEGIN + segment * segSize;
     spiffs->pos.size = segSize;
 
+    serial.log("New SPIFFS segment SET!");
+    delay(10);
+
     int err = writePartitionTable(table);
     if (err != ESP_OK) {
         serial.err("Can't write Partition table: %d", err);
@@ -459,12 +498,13 @@ int MultiBoot::setActiveSSPIFFSSegment(int segment) {
 }
 
 int MultiBoot::segmentForOTAFirmware(String path) {
+    serial.log("Enter function");
     // Вирахування сегменту в залежності від імені прошивки
     // Для простоти та зворотньої сумісності:
     // *.bin0, Keira -> 0 
     // *.bin, *.bin1 -> 1
     // *.bin2 -> 2, і так далі
-    path.toLowerCase();
+    //path.toLowerCase();
     if (path.endsWith("bin")) return 1;
 
     int fileExtPos = path.lastIndexOf("bin");
